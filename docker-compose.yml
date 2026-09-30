@@ -1,0 +1,8 @@
+services:
+  api:
+    build: .
+    image: replica-reconciler:latest
+    container_name: replica-reconciler
+    ports:
+      - "8000:8000"
+    restart: unless-stopped

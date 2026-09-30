@@ -15,7 +15,25 @@
 可重放的事件：在写入副本上追加 put/delete，其时钟并入所有冲突版本及该副本
 此前见过的历史；返回新事件与追加后该 key 的裁决。
 
-服务完全无状态，**请求数据不落库**。
+以上三个接口完全无状态，**请求数据不落库**。
+
+此外，本服务提供**持久化历史**接口，让多个调用方把离线事件汇入同一份
+保存在本地 SQLite 中的历史，并对该历史提交冲突处理：
+
+- `POST /api/histories`：用与 `/api/resolve` 完全相同的规则校验一个合法
+  批次并落库，返回历史 ID；
+- `GET /api/histories/{id}`：读取完整原格式批次（事件按 `replica_id`、
+  `seq` 排序）及该状态下的裁决，二者来自同一个已提交快照；
+- `POST /api/histories/{id}/events`：按 `(replica_id, seq)` 汇入更多事件，
+  内容完全相同的事件视为重发直接忽略，同一标识但内容不同返回 **409**；
+  合并后仍沿用原校验规则与 120 条上限，违例返回 **422**；
+- `POST /api/histories/{id}/resolve-conflict`：只提交原冲突处理参数
+  （不再传整个批次）；提交时核对**当前** versions、接续写入副本序号生成并
+  保存事件；versions 过期返回 **409**。
+
+每次写入都是单条 SQLite 事务，**全部生效或全部不生效**；写事务串行化，
+并发汇入/提交不会丢失事件、重复占用序号，也不可能用过期 versions 覆盖冲突。
+数据库文件位于 Compose 命名卷，**容器重启后历史仍可读取**。
 
 ## 启动
 
@@ -39,6 +57,10 @@ docker compose down
 | 裁决接口 | `POST http://localhost:8000/api/resolve` |
 | 冲突处理事件接口 | `POST http://localhost:8000/api/resolve-conflict` |
 | 增量补传接口 | `POST http://localhost:8000/api/catchup` |
+| 创建持久化历史 | `POST http://localhost:8000/api/histories` |
+| 读取历史（批次+裁决） | `GET http://localhost:8000/api/histories/{id}` |
+| 汇入事件 | `POST http://localhost:8000/api/histories/{id}/events` |
+| 提交冲突处理 | `POST http://localhost:8000/api/histories/{id}/resolve-conflict` |
 | Swagger UI | <http://localhost:8000/docs> |
 | OpenAPI 文档 | <http://localhost:8000/openapi.json> |
 
@@ -484,9 +506,195 @@ curl -sS -i -X POST http://localhost:8000/api/catchup \
 其余 `known_clock` 违例的错误码：`known_clock_coverage`（缺失/多余分量）、
 `known_clock_ahead_of_batch`（分量超过批次最高 seq）。
 
+## 持久化历史（多调用方汇入 + 提交冲突处理）
+
+历史保存在本地 SQLite（默认文件 `data/history.db`，可用环境变量
+`HISTORY_DB_PATH` 覆盖；Docker Compose 把命名卷 `history-data` 挂载到
+`/data`），容器重启或重新创建后历史依然存在。
+
+持久化接口的请求/响应约定：
+
+- 创建历史的请求体与 `/api/resolve` **完全一致**（`replica_ids` +
+  `events`），先按原规则整批校验，非法批次返回 **422** 且不落库；
+- 成功后返回 `id`，以及 `replica_ids`、按 `(replica_id, seq)` 排序的
+  `events`、当前裁决 `results`；
+- 之后所有操作只传 `id`，不再重复上传整个批次；
+- 汇入接口请求体只有 `events`（1～120 条）；冲突处理接口请求体只有
+  `key`、`replica_id`、`versions` 与 `put`/`delete`（形状与无状态
+  `/api/resolve-conflict` 除 `replica_ids`、`events` 外完全相同）。
+
+### 10. 创建历史并拿到 ID
+
+```bash
+curl -sS -X POST http://localhost:8000/api/histories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replica_ids": ["r1", "r2"],
+    "events": [
+      {"replica_id": "r2", "seq": 1, "key": "name", "put": "bob",
+       "clock": {"r1": 0, "r2": 1}},
+      {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+       "clock": {"r1": 1, "r2": 0}}
+    ]
+  }'
+```
+
+响应（`events` 已按 `replica_id`、`seq` 排序；`results` 是同一次提交状态
+下计算出的裁决）：
+
+```json
+{
+  "id": "f3bee1617eb1463db19f0e3e466b30c7",
+  "replica_ids": ["r1", "r2"],
+  "events": [
+    {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+     "clock": {"r1": 1, "r2": 0}},
+    {"replica_id": "r2", "seq": 1, "key": "name", "put": "bob",
+     "clock": {"r1": 0, "r2": 1}}
+  ],
+  "results": [
+    {"key": "name", "state": "conflict", "events": [
+      {"replica_id": "r1", "seq": 1, "op": "put", "value": "alice",
+       "clock": {"r1": 1, "r2": 0}},
+      {"replica_id": "r2", "seq": 1, "op": "put", "value": "bob",
+       "clock": {"r1": 0, "r2": 1}}
+    ]}
+  ]
+}
+```
+
+把 `id` 记下来（下文以 `$HID` 表示）。
+
+### 11. 按 ID 读取：完整原格式批次 + 同一状态的裁决
+
+```bash
+curl -sS http://localhost:8000/api/histories/$HID
+```
+
+返回与创建接口相同的 `replica_ids`、`events`（按 `replica_id`、`seq`
+排序）、`results`，二者来自同一个已提交快照。ID 不存在返回
+**404**（`history_not_found`）。
+
+### 12. 汇入事件：相同内容忽略，同标识异内容 409
+
+另一个调用方把离线产生的新事件按 `(replica_id, seq)` 汇入。汇入会先与
+历史中已有事件比对：
+
+- 同标识（`replica_id` + `seq`）且 `key`、操作、值、时钟完全一致 →
+  视为重发，忽略（批次内重复也忽略），不计入新增；
+- 同标识但任一内容不同 → **409** `event_content_mismatch`，整批不写入；
+- 新标识事件合并后，整份历史重新跑一遍原校验（时钟因果、seq 连续等），
+  并保持 120 条上限；违例 **422**，整批不写入（全部或全无）。
+
+```bash
+curl -sS -X POST http://localhost:8000/api/histories/$HID/events \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "events": [
+      {"replica_id": "r2", "seq": 2, "key": "other", "put": "x",
+       "clock": {"r1": 1, "r2": 2}},
+      {"replica_id": "r2", "seq": 1, "key": "name", "put": "bob",
+       "clock": {"r1": 0, "r2": 1}}
+    ]
+  }'
+```
+
+第二条是历史中已存在的相同事件，被忽略；第一条是新事件。响应中
+`added` 为实际新增条数，随后是合并后的完整批次与裁决：
+
+```json
+{
+  "id": "f3bee1617eb1463db19f0e3e466b30c7",
+  "added": 1,
+  "replica_ids": ["r1", "r2"],
+  "events": [ ... 合并后全部事件，按 replica_id、seq 排序 ... ],
+  "results": [ ... 合并后状态下的裁决 ... ]
+}
+```
+
+若把 `r1/1` 用不同内容（如 `"put": "alice-v2"`）再发一次，返回
+`409 Conflict`：
+
+```json
+{"detail": [{"code": "event_content_mismatch",
+  "message": "event with replica_id 'r1', seq 1 already exists in this history with different content; the same identity cannot be reused for another event",
+  "event_index": 0}]}
+```
+
+### 13. 提交冲突处理：核对当前 versions、接续序号、生成并保存事件
+
+只提交原冲突处理参数（不需要 `replica_ids`/`events`）。服务在串行化写
+事务内重新读取当前状态，校验 `versions` 是否**恰好等于**该 key 当前全部
+极大事件，然后在写入副本序号末尾生成新事件并保存——检查与写入在同一事务
+内完成：
+
+```bash
+curl -sS -X POST http://localhost:8000/api/histories/$HID/resolve-conflict \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "key": "name",
+    "replica_id": "r1",
+    "versions": [
+      {"replica_id": "r2", "seq": 1},
+      {"replica_id": "r1", "seq": 1}
+    ],
+    "put": "alice2"
+  }'
+```
+
+响应含生成的 `event`（接续 `r1` 的末尾，即 `r1/2`）、该 key 的新裁决
+`result`，以及更新后的完整批次与裁决：
+
+```json
+{
+  "id": "f3bee1617eb1463db19f0e3e466b30c7",
+  "event": {"replica_id": "r1", "seq": 2, "key": "name",
+            "put": "alice2", "clock": {"r1": 2, "r2": 1}},
+  "result": {"key": "name", "state": "put", "value": "alice2",
+             "event": {"replica_id": "r1", "seq": 2, "op": "put",
+                       "value": "alice2", "clock": {"r1": 2, "r2": 1}}},
+  "replica_ids": ["r1", "r2"],
+  "events": [ ... 含新保存的 r1/2 ... ],
+  "results": [ ... 与保存状态一致的裁决 ... ]
+}
+```
+
+此时 key 已不冲突。再拿旧的 versions（`r1/1`、`r2/1`）提交会返回
+**409**（`key_not_conflicted` 或 `conflict_versions_mismatch`），且不
+生成、不保存任何事件——并发提交时只有一个调用方成功，其余全部收到 409，
+不会重复占用 `r1/2` 这个序号，也不会用过期 versions 覆盖已生效的处理。
+
+状态码汇总（持久化接口）：
+
+| 状态 | 场景 |
+| --- | --- |
+| 200 | 创建 / 读取 / 汇入（`added` 可能为 0）/ 冲突处理成功 |
+| 404 | ID 不存在（`history_not_found`） |
+| 409 | 同标识异内容（`event_content_mismatch`）；versions 过期/不完整（`conflict_versions_mismatch`）；key 已不冲突（`key_not_conflicted`） |
+| 422 | 原批次/合并后批次校验失败、超过 120 条（`batch_full`）、写入副本未知（`unknown_replica_id`）、版本列表重复（`duplicate_conflict_version`）等 |
+
+### 14. 容器重启后历史仍在
+
+数据保存在命名卷 `history-data` 中，重启不丢：
+
+```bash
+docker compose restart api
+curl -sS http://localhost:8000/api/histories/$HID   # 仍返回完整批次与裁决
+```
+
+`docker compose down`（不加 `-v`）同样保留卷；`docker compose down -v`
+才会删除历史数据。
+
 ## 本地开发（不使用 Docker）
 
 ```bash
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
+```
+
+持久化历史默认写入工作目录下的 `data/history.db`（首次启动自动创建），
+可用 `HISTORY_DB_PATH` 环境变量指定其他位置：
+
+```bash
+HISTORY_DB_PATH=/tmp/history.db uvicorn app.main:app --reload --port 8000
 ```

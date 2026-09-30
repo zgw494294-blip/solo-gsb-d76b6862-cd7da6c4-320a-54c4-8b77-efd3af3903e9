@@ -17,11 +17,31 @@ to the writing replica, with a clock covering every conflicting version and
 the writer's own prior history, and returns the new event together with the
 key's post-append verdict.
 
-The service is stateless: request payloads are never persisted.
+The three endpoints above are stateless: request payloads are never
+persisted.  In addition, persistent *histories* let several callers merge
+offline events into the same stored causal history:
+
+* ``POST /api/histories`` validates a batch exactly like /api/resolve and
+  stores it under a generated ID;
+* ``GET /api/histories/{id}`` returns the stored batch (events sorted by
+  replica_id then seq) together with its verdict from the same committed
+  state;
+* ``POST /api/histories/{id}/events`` merges more events by
+  ``(replica_id, seq)``: identical events are ignored, same-id/different
+  payload events are 409, then the original validation plus the 120-event
+  cap are enforced (422);
+* ``POST /api/histories/{id}/resolve-conflict`` commits a resolution
+  against the *current* versions and appends the generated event to the
+  replica's seq tail; a stale version list is 409.
+
+Every write is a single SQLite transaction -- all or nothing -- and write
+transactions are serialized so concurrent merges/resolutions cannot lose
+events, double-allocate seqs, or overwrite a conflict with stale versions.
 """
 
 from __future__ import annotations
 
+import uuid
 from typing import Annotated, Optional
 
 from fastapi import FastAPI, Request
@@ -29,6 +49,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictStr
 from pydantic import model_validator
+
+from app import db
 
 app = FastAPI(
     title="Multi-Replica Offline Write Reconciler",
@@ -191,6 +213,67 @@ class ResolveConflictRequest(ResolveRequest):
         return self
 
 
+class CreateHistoryRequest(ResolveRequest):
+    """Initial batch of a new persistent history."""
+
+
+class MergeEventsRequest(BaseModel):
+    """Offline events merged into an existing history."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    events: Annotated[
+        list[Event],
+        Field(min_length=1, max_length=120, description="1-120 events to merge."),
+    ]
+
+
+class HistoryResolveConflictRequest(BaseModel):
+    """Conflict-resolution parameters for a stored history (no batch body)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: Annotated[str, Field(min_length=1, description="Conflicting key to resolve.")]
+    replica_id: Annotated[
+        str,
+        Field(
+            min_length=1,
+            description="Replica that writes the resolution event; must be "
+            "one of the history's replica_ids.",
+        ),
+    ]
+    versions: Annotated[
+        list[ConflictVersion],
+        Field(
+            min_length=2,
+            description=(
+                "The conflicting versions as seen when resolving: each with "
+                "replica_id and seq; no duplicates, at least two."
+            ),
+        ),
+    ]
+    put: Optional[StrictStr] = Field(
+        default=None, description="Set when the resolution is a put (empty string allowed)."
+    )
+    delete: Optional[StrictStr] = Field(
+        default=None,
+        description="Must equal 'delete' when the resolution is a deletion.",
+    )
+
+    @model_validator(mode="after")
+    def _exactly_one_op(self) -> "HistoryResolveConflictRequest":
+        has_put = self.put is not None
+        has_delete = self.delete is not None
+        if has_put == has_delete:
+            raise ValueError(
+                "exactly one of 'put' (string value) or 'delete' (\"delete\") "
+                "must be provided"
+            )
+        if has_delete and self.delete != "delete":
+            raise ValueError("the 'delete' field must equal the string \"delete\"")
+        return self
+
+
 # ---------------------------------------------------------------------------
 # Error type
 # ---------------------------------------------------------------------------
@@ -210,6 +293,14 @@ class ConflictStateError(Exception):
     def __init__(self, errors: list[dict]):
         super().__init__("conflict resolution out of date")
         self.errors = errors
+
+
+class UnknownHistoryError(Exception):
+    """No stored history exists for the given ID (HTTP 404)."""
+
+    def __init__(self, history_id: str):
+        super().__init__(f"unknown history {history_id}")
+        self.history_id = history_id
 
 
 def _err(code: str, message: str, event_index: int | None = None) -> dict:
@@ -660,6 +751,98 @@ def build_resolution_event(
 
 
 # ---------------------------------------------------------------------------
+# Persistent-history event merge
+# ---------------------------------------------------------------------------
+
+
+def _event_full_wire(ev: Event) -> dict:
+    """Canonical wire content of an event for identity/content comparison."""
+
+    return {
+        "replica_id": ev.replica_id,
+        "seq": ev.seq,
+        "key": ev.key,
+        **({"put": ev.put} if ev.put is not None else {"delete": "delete"}),
+        "clock": dict(ev.clock),
+    }
+
+
+def merge_events(
+    replica_ids: list[str],
+    existing: list[Event],
+    incoming: list[Event],
+) -> tuple[list[Event], list[Event]]:
+    """Merge incoming events into a stored history by (replica_id, seq).
+
+    * same identity with byte-identical content (key/op/value/clock) is
+      ignored (a resend), including duplicates within the incoming batch;
+    * same identity with different content raises ConflictStateError (409);
+    * an event whose replica_id is not one of the history's replicas is a
+      structural error (422), mirroring validate_batch.
+
+    Returns the merged list and the genuinely new events, both sorted by
+    (replica_id, seq).  The caller still re-runs validate_batch (causal
+    checks, contiguous seq ...) and enforces the 120-event cap.
+    """
+
+    replica_set = set(replica_ids)
+
+    errors: list[dict] = []
+    for i, ev in enumerate(incoming):
+        if ev.replica_id not in replica_set:
+            errors.append(
+                _err(
+                    "unknown_replica_id",
+                    f"event replica_id {ev.replica_id!r} is not listed in "
+                    "the history's replica_ids",
+                    i,
+                )
+            )
+    if errors:
+        raise BatchError(errors)
+
+    by_ident: dict[tuple[str, int], Event] = {
+        (ev.replica_id, ev.seq): ev for ev in existing
+    }
+    merged = list(existing)
+    new_events: list[Event] = []
+    added_idents: set[tuple[str, int]] = set()
+
+    for i, ev in enumerate(incoming):
+        ident = (ev.replica_id, ev.seq)
+        current = by_ident.get(ident)
+        if current is not None:
+            if _event_full_wire(current) != _event_full_wire(ev):
+                raise ConflictStateError(
+                    [
+                        {
+                            "code": "event_content_mismatch",
+                            "message": (
+                                f"event with replica_id {ev.replica_id!r}, seq "
+                                f"{ev.seq} already exists in this history with "
+                                "different content; the same identity cannot be "
+                                "reused for another event"
+                            ),
+                            "event_index": i,
+                        }
+                    ]
+                )
+            # Identical resend: ignore.
+            continue
+        if ident in added_idents:
+            # Duplicate of an identical event seen earlier in this same batch.
+            continue
+        by_ident[ident] = ev
+        added_idents.add(ident)
+        merged.append(ev)
+        new_events.append(ev)
+
+    merged.sort(key=lambda e: (e.replica_id, e.seq))
+    new_events.sort(key=lambda e: (e.replica_id, e.seq))
+    return merged, new_events
+
+
+# ---------------------------------------------------------------------------
 # Incremental catch-up plan
 # ---------------------------------------------------------------------------
 
@@ -864,6 +1047,23 @@ async def conflict_state_error_handler(
     )
 
 
+@app.exception_handler(UnknownHistoryError)
+async def unknown_history_error_handler(
+    request: Request, exc: UnknownHistoryError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "detail": [
+                {
+                    "code": "history_not_found",
+                    "message": f"no history with id {exc.history_id!r}",
+                }
+            ]
+        },
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def request_validation_error_handler(
     request: Request, exc: RequestValidationError
@@ -926,3 +1126,155 @@ async def catchup_batch(body: CatchupRequest) -> dict:
     return plan_catchup(
         body.replica_ids, body.events, body.known_clock, max_seq
     )
+
+
+# ---------------------------------------------------------------------------
+# Persistent histories (SQLite)
+# ---------------------------------------------------------------------------
+
+
+def _ordered_clock(clock: dict[str, int], replica_ids: list[str]) -> dict[str, int]:
+    return {rid: clock[rid] for rid in replica_ids}
+
+
+def _stored_event_wire(wire: dict, replica_ids: list[str]) -> dict:
+    """Normalize a persisted event to the original request wire format."""
+
+    out = {
+        "replica_id": wire["replica_id"],
+        "seq": wire["seq"],
+        "key": wire["key"],
+    }
+    if "put" in wire:
+        out["put"] = wire["put"]
+    else:
+        out["delete"] = "delete"
+    out["clock"] = _ordered_clock(wire["clock"], replica_ids)
+    return out
+
+
+def _history_view(record: dict) -> dict:
+    """Full stored batch (sorted events) plus its current verdict."""
+
+    replica_ids = record["replica_ids"]
+    events = [_stored_event_wire(w, replica_ids) for w in record["events"]]
+    parsed = [Event(**w) for w in events]
+    return {
+        "replica_ids": replica_ids,
+        "events": events,
+        "results": resolve(parsed, replica_ids),
+    }
+
+
+@app.post("/api/histories", tags=["histories"], response_model=None)
+def create_history(body: CreateHistoryRequest) -> dict:
+    """Validate a batch like /api/resolve and persist it as a new history."""
+
+    validate_batch(body.replica_ids, body.events)
+    history_id = uuid.uuid4().hex
+
+    with db.write_tx() as conn:
+        db.insert_history(conn, history_id, body.replica_ids, body.events)
+        record = db.load_history(conn, history_id)
+
+    view = _history_view(record)
+    return {"id": history_id, **view}
+
+
+@app.get("/api/histories/{history_id}", tags=["histories"], response_model=None)
+def get_history(history_id: str) -> dict:
+    """Return the full stored batch and verdict; 404 when the ID is unknown."""
+
+    with db.read_tx() as conn:
+        record = db.load_history(conn, history_id)
+    if record is None:
+        raise UnknownHistoryError(history_id)
+    return {"id": history_id, **_history_view(record)}
+
+
+@app.post("/api/histories/{history_id}/events", tags=["histories"], response_model=None)
+def merge_history_events(history_id: str, body: MergeEventsRequest) -> dict:
+    """Merge more offline events into a stored history.
+
+    Merge by ``(replica_id, seq)``: identical events ignored, same identity
+    with different content -> 409.  The merged history must still pass the
+    original batch validation and the 120-event cap (422 otherwise).
+    """
+
+    with db.write_tx() as conn:
+        record = db.load_history(conn, history_id)
+        if record is None:
+            raise UnknownHistoryError(history_id)
+
+        replica_ids = record["replica_ids"]
+        existing = [Event(**w) for w in record["events"]]
+
+        merged, new_events = merge_events(replica_ids, existing, body.events)
+
+        if len(merged) > 120:
+            raise BatchError(
+                [
+                    _err(
+                        "batch_full",
+                        f"history already contains {len(existing)} events and "
+                        f"the merge adds {len(new_events)} new event(s); the "
+                        "merged batch would exceed the 120-event limit",
+                    )
+                ]
+            )
+
+        validate_batch(replica_ids, merged)
+
+        db.insert_events(conn, history_id, new_events)
+        record = db.load_history(conn, history_id)
+
+    view = _history_view(record)
+    return {"id": history_id, "added": len(new_events), **view}
+
+
+@app.post(
+    "/api/histories/{history_id}/resolve-conflict",
+    tags=["histories"],
+    response_model=None,
+)
+def resolve_history_conflict(
+    history_id: str, body: HistoryResolveConflictRequest
+) -> dict:
+    """Commit a conflict resolution against the *current* stored versions.
+
+    The supplied versions are checked against the current maximal events
+    inside the serialized write transaction; the generated event continues
+    the writer's seq tail and is generated and saved in the same transaction
+    that performs the check, so a stale version list is rejected with 409 and
+    concurrent resolutions can neither double-allocate a seq nor overwrite a
+    conflict.
+    """
+
+    with db.write_tx() as conn:
+        record = db.load_history(conn, history_id)
+        if record is None:
+            raise UnknownHistoryError(history_id)
+
+        replica_ids = record["replica_ids"]
+        events = [Event(**w) for w in record["events"]]
+        seen = validate_batch(replica_ids, events)
+
+        new_event, verdict = build_resolution_event(
+            replica_ids=replica_ids,
+            events=events,
+            seen=seen,
+            key=body.key,
+            writer=body.replica_id,
+            versions=body.versions,
+            put=body.put,
+            delete=body.delete,
+        )
+        db.insert_events(conn, history_id, [new_event])
+        record = db.load_history(conn, history_id)
+
+    view = _history_view(record)
+    return {"id": history_id, "event": _event_wire(new_event), "result": verdict, **view}
+
+
+# Open/create the local SQLite database on startup (idempotent).
+db.init_db()

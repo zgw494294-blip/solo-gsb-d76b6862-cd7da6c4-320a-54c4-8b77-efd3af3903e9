@@ -2,9 +2,12 @@ FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    HISTORY_DB_PATH=/data/history.db
 
 WORKDIR /app
+
+RUN mkdir -p /data
 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt

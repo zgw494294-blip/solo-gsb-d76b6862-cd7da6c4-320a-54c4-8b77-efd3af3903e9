@@ -15,7 +15,14 @@
 可重放的事件：在写入副本上追加 put/delete，其时钟并入所有冲突版本及该副本
 此前见过的历史；返回新事件与追加后该 key 的裁决。
 
-服务完全无状态，**请求数据不落库**。
+上述三个接口完全无状态，**请求数据不落库**。
+
+另外还提供一组**持久化历史**接口（`/api/histories`）：多个调用方先凭一份
+合法批次创建历史并获得 ID，之后只按 ID 读取、汇入新的离线事件、或按 ID 提交
+冲突处理参数（不必再传整个批次）。汇入按 `(replica_id, seq)` 合并：内容完全
+相同的事件忽略，同标识异内容返回 **409**；冲突提交时会重新核对当前极大版本，
+过期返回 **409**。历史保存在本地 SQLite（Docker 下位于命名卷），容器重启后
+仍可读取。
 
 ## 启动
 
@@ -39,6 +46,10 @@ docker compose down
 | 裁决接口 | `POST http://localhost:8000/api/resolve` |
 | 冲突处理事件接口 | `POST http://localhost:8000/api/resolve-conflict` |
 | 增量补传接口 | `POST http://localhost:8000/api/catchup` |
+| 创建持久历史 | `POST http://localhost:8000/api/histories` |
+| 读取历史（批次+裁决） | `GET http://localhost:8000/api/histories/{id}` |
+| 汇入离线事件 | `POST http://localhost:8000/api/histories/{id}/events` |
+| 提交冲突处理 | `POST http://localhost:8000/api/histories/{id}/resolve-conflict` |
 | Swagger UI | <http://localhost:8000/docs> |
 | OpenAPI 文档 | <http://localhost:8000/openapi.json> |
 
@@ -484,9 +495,198 @@ curl -sS -i -X POST http://localhost:8000/api/catchup \
 其余 `known_clock` 违例的错误码：`known_clock_coverage`（缺失/多余分量）、
 `known_clock_ahead_of_batch`（分量超过批次最高 seq）。
 
+## 持久化历史接口 `/api/histories`
+
+让多个调用方在**同一份持久历史**上汇入离线事件、提交冲突处理。数据库为本地
+SQLite 文件，路径由环境变量 `HISTORY_DB_PATH` 决定；`docker compose` 启动时
+固定为容器内 `/data/history.db` 并挂载命名卷 `history-data`，因此
+`docker compose restart` / 容器重建后历史仍可读取。原三个无状态接口与
+`docker compose up --build -d` 启动方式保持不变。
+
+接口：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/histories` | 用合法的 `replica_ids` + `events` 创建历史，返回 `{"id": ...}`（201） |
+| `GET` | `/api/histories/{id}` | 读取完整原格式批次（事件按 `replica_id`、`seq` 排序）及原裁决，二者来自同一已提交状态 |
+| `POST` | `/api/histories/{id}/events` | 按 ID 汇入一批事件（请求体只有 `events`） |
+| `POST` | `/api/histories/{id}/resolve-conflict` | 按 ID 提交原冲突处理参数（`key`、`replica_id`、`versions`、`put`/`delete`），不再传整个批次 |
+
+汇入规则：
+
+- 按 `(replica_id, seq)` 合并：同标识且内容完全相同的事件忽略（可重复发送）；
+  同标识但 `key`/操作/值/`clock` 任一不同，返回 **409**
+  （`event_content_mismatch`，错误中带汇入批次的 `event_index`）；
+- 合并后的整份历史重新执行原校验（因果、连续性、clock 覆盖等），失败
+  **422**；事件总数上限仍为 **120**（超出为 `batch_full`，422）；
+- 每次写入**全部生效或全部不生效**（单事务），失败时历史保持原样。
+
+冲突提交规则：
+
+- 服务端在写锁内重新读取当前历史，`versions` 必须**恰好等于**该 key 当前全部
+  极大事件；过期/不完整/key 已不冲突 → **409**（与无状态接口同一套错误码），
+  且不生成事件；
+- 新事件 `seq` 接续写入副本现有末尾（此前无事件时为 1），时钟并入全部冲突
+  版本与写入副本历史，随后随整份历史一起原子写入；
+- 并发提交同一冲突时只有一个能成功，其余拿到 409，不会重复占用序号。
+
+不存在的 ID 在三个按 ID 访问的接口上都返回 **404**（`history_not_found`）。
+
+### 10. 创建历史并获得 ID
+
+```bash
+curl -sS -X POST http://localhost:8000/api/histories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replica_ids": ["r1", "r2"],
+    "events": [
+      {"replica_id": "r2", "seq": 1, "key": "name", "put": "bob",
+       "clock": {"r1": 0, "r2": 1}},
+      {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+       "clock": {"r1": 1, "r2": 0}}
+    ]
+  }'
+```
+
+```json
+{ "id": "f82cdf528c99461c9a6becef9edddd1f" }
+```
+
+创建请求的约束与 `/api/resolve` 完全一致；非法批次返回 **422**，不会生成
+历史。
+
+### 11. 按 ID 读取：完整原格式批次 + 原裁决（同一已提交状态）
+
+```bash
+curl -sS http://localhost:8000/api/histories/f82cdf528c99461c9a6becef9edddd1f
+```
+
+事件在响应中按 `replica_id`、`seq` 排序（与创建时的提交顺序无关）：
+
+```json
+{
+  "id": "f82cdf528c99461c9a6becef9edddd1f",
+  "replica_ids": ["r1", "r2"],
+  "events": [
+    {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+     "clock": {"r1": 1, "r2": 0}},
+    {"replica_id": "r2", "seq": 1, "key": "name", "put": "bob",
+     "clock": {"r1": 0, "r2": 1}}
+  ],
+  "results": [
+    {
+      "key": "name",
+      "state": "conflict",
+      "events": [
+        {"replica_id": "r1", "seq": 1, "op": "put", "value": "alice",
+         "clock": {"r1": 1, "r2": 0}},
+        {"replica_id": "r2", "seq": 1, "op": "put", "value": "bob",
+         "clock": {"r1": 0, "r2": 1}}
+      ]
+    }
+  ]
+}
+```
+
+### 12. 汇入离线事件：重复忽略、新事件合并
+
+请求体只需要 `events`（不再传 `replica_ids` 或整个批次）。下面把已有的
+`r1/1`（内容相同，忽略）与新事件 `r2/2` 一起汇入：
+
+```bash
+curl -sS -X POST \
+  http://localhost:8000/api/histories/f82cdf528c99461c9a6becef9edddd1f/events \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "events": [
+      {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+       "clock": {"r1": 1, "r2": 0}},
+      {"replica_id": "r2", "seq": 2, "key": "other", "put": "x",
+       "clock": {"r1": 0, "r2": 2}}
+    ]
+  }'
+```
+
+响应与 `GET` 形状一致（`id`、`replica_ids`、排序后的完整 `events`、
+`results`）。同标识异内容返回 **409**，且整批（含批次内其他合法事件）都不
+写入：
+
+```json
+{
+  "detail": [
+    {
+      "code": "event_content_mismatch",
+      "message": "event with replica_id 'r1', seq 1 already exists in this history with different content; ...",
+      "event_index": 0
+    }
+  ]
+}
+```
+
+合并后违反因果/连续性等原校验，或超出 120 条上限时返回 **422**。
+
+### 13. 按 ID 提交冲突处理：核对当前 versions、接续序号
+
+请求体就是原冲突处理参数（与 `/api/resolve-conflict` 相比少了
+`replica_ids`、`events`）：
+
+```bash
+curl -sS -X POST \
+  http://localhost:8000/api/histories/f82cdf528c99461c9a6becef9edddd1f/resolve-conflict \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "key": "name",
+    "replica_id": "r1",
+    "versions": [
+      {"replica_id": "r2", "seq": 1},
+      {"replica_id": "r1", "seq": 1}
+    ],
+    "put": "chosen"
+  }'
+```
+
+```json
+{
+  "id": "f82cdf528c99461c9a6becef9edddd1f",
+  "event": {
+    "replica_id": "r1",
+    "seq": 2,
+    "key": "name",
+    "put": "chosen",
+    "clock": {"r1": 2, "r2": 1}
+  },
+  "result": {
+    "key": "name",
+    "state": "put",
+    "value": "chosen",
+    "event": {"replica_id": "r1", "seq": 2, "op": "put", "value": "chosen",
+              "clock": {"r1": 2, "r2": 1}}
+  }
+}
+```
+
+生成的事件已持久化到历史中（`GET` 即可看到，事件按 `replica_id`、`seq`
+排序）。再用旧的 `versions` 提交会返回 **409**（`key_not_conflicted` 或
+`conflict_versions_mismatch`），不生成事件、不占用 `r2/2` 序号。
+
+### 14. 重启容器后历史仍在
+
+数据在命名卷 `history-data` 中，重启/重建容器（不改卷）后按原 ID 仍可读取：
+
+```bash
+docker compose restart
+curl -sS http://localhost:8000/api/histories/f82cdf528c99461c9a6becef9edddd1f
+```
+
+如需连数据一起清除：`docker compose down -v`。
+
 ## 本地开发（不使用 Docker）
 
 ```bash
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
+
+本地运行时持久化历史默认写入当前目录的 `history.db`（可用环境变量
+`HISTORY_DB_PATH` 指定其他路径，例如 `HISTORY_DB_PATH=/tmp/history.db`）；
+三个无状态接口不依赖数据库。

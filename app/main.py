@@ -17,11 +17,21 @@ to the writing replica, with a clock covering every conflicting version and
 the writer's own prior history, and returns the new event together with the
 key's post-append verdict.
 
-The service is stateless: request payloads are never persisted.
+The three endpoints above are stateless: request payloads are never persisted.
+A second family of endpoints (/api/histories) gives multiple callers one
+shared, persistent history created from a valid batch: callers then merge in
+more offline events by ID (identical events are ignored, same
+replica_id/seq with different content is 409) and commit conflict resolutions
+by ID with only the original resolution parameters (key, writer, versions,
+op) -- the stored versions are re-checked at commit time and stale lists get
+409.  Histories live in a local SQLite database (HISTORY_DB_PATH, WAL) and
+therefore survive container restarts.
 """
 
 from __future__ import annotations
 
+import json
+import uuid
 from typing import Annotated, Optional
 
 from fastapi import FastAPI, Request
@@ -29,6 +39,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, StrictStr
 from pydantic import model_validator
+
+from . import store
 
 app = FastAPI(
     title="Multi-Replica Offline Write Reconciler",
@@ -147,8 +159,10 @@ class ConflictVersion(BaseModel):
     ]
 
 
-class ResolveConflictRequest(ResolveRequest):
-    """Original batch plus the confirmed resolution of one conflicting key."""
+class ConflictDecision(BaseModel):
+    """The original conflict-resolution parameters, without any batch."""
+
+    model_config = ConfigDict(extra="forbid")
 
     key: Annotated[str, Field(min_length=1, description="Conflicting key to resolve.")]
     replica_id: Annotated[
@@ -156,7 +170,7 @@ class ResolveConflictRequest(ResolveRequest):
         Field(
             min_length=1,
             description="Replica that writes the resolution event; must be "
-            "listed in replica_ids.",
+            "one of the history's replica_ids.",
         ),
     ]
     versions: Annotated[
@@ -178,7 +192,7 @@ class ResolveConflictRequest(ResolveRequest):
     )
 
     @model_validator(mode="after")
-    def _exactly_one_op(self) -> "ResolveConflictRequest":
+    def _exactly_one_op(self) -> "ConflictDecision":
         has_put = self.put is not None
         has_delete = self.delete is not None
         if has_put == has_delete:
@@ -189,6 +203,19 @@ class ResolveConflictRequest(ResolveRequest):
         if has_delete and self.delete != "delete":
             raise ValueError("the 'delete' field must equal the string \"delete\"")
         return self
+
+
+class ResolveConflictRequest(ResolveRequest, ConflictDecision):
+    """Original batch plus the confirmed resolution of one conflicting key."""
+
+
+class MergeEventsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    events: Annotated[
+        list[Event],
+        Field(min_length=1, max_length=120, description="1-120 events to merge, any order."),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +237,14 @@ class ConflictStateError(Exception):
     def __init__(self, errors: list[dict]):
         super().__init__("conflict resolution out of date")
         self.errors = errors
+
+
+class HistoryNotFound(Exception):
+    """No persistent history exists for the referenced ID (HTTP 404)."""
+
+    def __init__(self, history_id: str):
+        super().__init__(f"history {history_id!r} not found")
+        self.history_id = history_id
 
 
 def _err(code: str, message: str, event_index: int | None = None) -> dict:
@@ -461,6 +496,115 @@ def _event_wire(ev: Event) -> dict:
         out["delete"] = "delete"
     out["clock"] = dict(ev.clock)
     return out
+
+
+def _canonical_wire(ev: Event, replica_ids: list[str]) -> dict:
+    """Wire form with clock keys in the history's replica_ids order."""
+
+    out = _event_wire(ev)
+    out["clock"] = {rid: ev.clock[rid] for rid in replica_ids}
+    return out
+
+
+def _wire_model(raw: dict, replica_ids: list[str]) -> Event:
+    """Parse a stored wire event back into an Event (clock order irrelevant)."""
+
+    payload = dict(raw)
+    payload["clock"] = {rid: raw["clock"][rid] for rid in replica_ids}
+    return Event.model_validate(payload)
+
+
+def _load_row(row: object) -> tuple[str, list[str], list[Event]]:
+    replica_ids: list[str] = json.loads(row["replica_ids"])
+    events = [_wire_model(raw, replica_ids) for raw in json.loads(row["events"])]
+    return row["id"], replica_ids, events
+
+
+def _canonical_events(
+    events: list[Event], replica_ids: list[str]
+) -> list[dict]:
+    """Canonical persisted/returned order: replica_id then seq."""
+
+    return [
+        _canonical_wire(ev, replica_ids)
+        for ev in sorted(events, key=lambda e: (e.replica_id, e.seq))
+    ]
+
+
+def _history_state(
+    history_id: str, replica_ids: list[str], events: list[Event]
+) -> dict:
+    """Full original-format batch plus the verdict over the same events."""
+
+    ordered = sorted(events, key=lambda e: (e.replica_id, e.seq))
+    return {
+        "id": history_id,
+        "replica_ids": list(replica_ids),
+        "events": [_canonical_wire(ev, replica_ids) for ev in ordered],
+        "results": resolve(ordered, replica_ids),
+    }
+
+
+def _batch_full_error() -> BatchError:
+    return BatchError(
+        [
+            _err(
+                "batch_full",
+                "the history already contains 120 events; the 120-event "
+                "limit leaves no room to merge or append more events",
+            )
+        ]
+    )
+
+
+def _merge_events(
+    replica_ids: list[str],
+    current: list[Event],
+    incoming: list[Event],
+) -> list[Event]:
+    """Merge incoming events by (replica_id, seq) into the stored history.
+
+    Identical events (same identity and same full content) are ignored; the
+    same (replica_id, seq) with different content is a 409.  The merged list
+    is then checked against the original batch validation and the 120-event
+    cap (422).  Either the whole merge applies or nothing does.
+    """
+
+    stored = {(ev.replica_id, ev.seq): ev for ev in current}
+
+    merged = list(current)
+    for i, ev in enumerate(incoming):
+        prior = stored.get((ev.replica_id, ev.seq))
+        if prior is not None:
+            if _canonical_wire(prior, replica_ids) != _canonical_wire(
+                ev, replica_ids
+            ):
+                raise ConflictStateError(
+                    [
+                        {
+                            "code": "event_content_mismatch",
+                            "message": (
+                                f"event with replica_id {ev.replica_id!r}, "
+                                f"seq {ev.seq} already exists in this history "
+                                "with different content; stored "
+                                f"{_event_wire(prior)!r}, incoming "
+                                f"{_event_wire(ev)!r}"
+                            ),
+                            "event_index": i,
+                        }
+                    ]
+                )
+            # Same identity, identical content -> ignore.
+            continue
+        stored[(ev.replica_id, ev.seq)] = ev
+        merged.append(ev)
+
+    if len(merged) > 120:
+        raise _batch_full_error()
+
+    # Re-run the original validation on the whole merged history.
+    validate_batch(replica_ids, merged)
+    return merged
 
 
 def _key_verdict(key: str, group: list[Event], replica_ids: list[str]) -> dict:
@@ -864,6 +1008,23 @@ async def conflict_state_error_handler(
     )
 
 
+@app.exception_handler(HistoryNotFound)
+async def history_not_found_handler(
+    request: Request, exc: HistoryNotFound
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "detail": [
+                {
+                    "code": "history_not_found",
+                    "message": f"no history exists with id {exc.history_id!r}",
+                }
+            ]
+        },
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def request_validation_error_handler(
     request: Request, exc: RequestValidationError
@@ -926,3 +1087,111 @@ async def catchup_batch(body: CatchupRequest) -> dict:
     return plan_catchup(
         body.replica_ids, body.events, body.known_clock, max_seq
     )
+
+
+# ---------------------------------------------------------------------------
+# Persistent histories (/api/histories)
+#
+# Every mutation runs inside one BEGIN IMMEDIATE transaction (see store.py),
+# which serialises all read-modify-write sequences: merges and conflict
+# commits can neither lose events nor allocate the same seq twice, and a
+# commit is always evaluated against -- and written back to -- the current
+# committed state.  Any validation/conflict failure rolls the transaction
+# back, so each write is all-or-nothing.
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/histories", tags=["histories"], response_model=None, status_code=201)
+def create_history(body: ResolveRequest) -> dict:
+    """Validate a batch and persist it as a new history, returning its ID."""
+
+    validate_batch(body.replica_ids, body.events)
+    history_id = uuid.uuid4().hex
+    with store.write_transaction() as conn:
+        store.insert_history(
+            conn,
+            history_id,
+            body.replica_ids,
+            _canonical_events(body.events, body.replica_ids),
+        )
+    return {"id": history_id}
+
+
+@app.get("/api/histories/{history_id}", tags=["histories"], response_model=None)
+def read_history(history_id: str) -> dict:
+    """Return the stored batch (original wire format) and its verdicts.
+
+    Events are sorted by replica_id then seq; both the batch and ``results``
+    come from one committed snapshot.  Unknown IDs get 404.
+    """
+
+    row = store.get_history(history_id)
+    if row is None:
+        raise HistoryNotFound(history_id)
+    hid, replica_ids, events = _load_row(row)
+    return _history_state(hid, replica_ids, events)
+
+
+@app.post(
+    "/api/histories/{history_id}/events",
+    tags=["histories"],
+    response_model=None,
+)
+def merge_history_events(history_id: str, body: MergeEventsRequest) -> dict:
+    """Merge offline events into a history and return the merged state.
+
+    Merge key is (replica_id, seq): identical events are ignored and the same
+    identity with different content is 409.  The merged history must still
+    satisfy the original validation and the 120-event limit, otherwise the
+    whole merge is rejected with 422 and nothing is written.
+    """
+
+    with store.write_transaction() as conn:
+        row = store.select_for_update(conn, history_id)
+        if row is None:
+            raise HistoryNotFound(history_id)
+        hid, replica_ids, events = _load_row(row)
+        merged = _merge_events(replica_ids, events, body.events)
+        store.update_events(
+            conn, hid, _canonical_events(merged, replica_ids)
+        )
+        return _history_state(hid, replica_ids, merged)
+
+
+@app.post(
+    "/api/histories/{history_id}/resolve-conflict",
+    tags=["histories"],
+    response_model=None,
+)
+def commit_history_conflict(history_id: str, body: ConflictDecision) -> dict:
+    """Commit a confirmed conflict resolution into a stored history.
+
+    Only the original resolution parameters are supplied (key, writing
+    replica_id, versions, put/delete); the batch itself is read from the
+    history under a serialised write lock.  ``versions`` must equal the
+    key's current maximal events -- a stale list gets 409 and no event is
+    generated.  The new event continues the writer's seq tail and is
+    persisted together with the whole history atomically.
+    """
+
+    with store.write_transaction() as conn:
+        row = store.select_for_update(conn, history_id)
+        if row is None:
+            raise HistoryNotFound(history_id)
+        hid, replica_ids, events = _load_row(row)
+        new_event, verdict = build_resolution_event(
+            replica_ids=replica_ids,
+            events=events,
+            seen={(ev.replica_id, ev.seq): ev for ev in events},
+            key=body.key,
+            writer=body.replica_id,
+            versions=body.versions,
+            put=body.put,
+            delete=body.delete,
+        )
+        merged = events + [new_event]
+        store.update_events(
+            conn, hid, _canonical_events(merged, replica_ids)
+        )
+        return {"id": hid, "event": _canonical_wire(new_event, replica_ids),
+                "result": verdict}
